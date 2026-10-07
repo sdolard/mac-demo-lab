@@ -15,6 +15,7 @@ Working dev scaffold:
 - `--move` runs a continuous camera path instead of hard cuts, `--no-denoise` shows the raw image for comparison;
 - FPS shown in the window title; offscreen modes print it;
 - `--smoke` renders offscreen headlessly, `--shot` captures a PPM still at any `--size`;
+- a software synth (`src/synth.cpp`) sequences a 16-bar track at 128 BPM (pads, bass, arp, lead, kick/snare/hats, ping-pong delay + Freeverb-style reverb) and renders it to WAV with `--render-audio`;
 - `sdf` mode keeps the original raymarched raster scene as a lighter fallback;
 - `release.sh` produces a self-extracting file gated at 65536 bytes.
 
@@ -31,9 +32,16 @@ out/demo --no-denoise             # raw image, for comparison
 out/demo --mode sdf               # raymarched raster mode
 out/demo --smoke 60               # offscreen render + fps report
 out/demo --shot shot.ppm 120 --size 2560x1440 --scale 0.5 --spp 8
+out/demo --render-audio track.wav # render the sequenced track (33.5 s) to WAV
 python3 tools/ppm2png.py shot.ppm shot.png
 ./release.sh                      # out/demo64k, self-extracting, hard 64 KiB gate
 ```
+
+## Audio
+
+`src/synth.cpp` is a dependency-free software synth: polyBLEP saw/pulse oscillators, TPT state-variable filters, one-shot instrument renderers (pad, bass, arp, lead, kick, snare, hats, riser), a ping-pong delay and a Freeverb-style reverb. The sequencer is 16 bars at 128 BPM (Am - F - C - G) with intro, build, main and ending sections, plus a 3.5 s effect tail.
+
+The whole track renders in under a second (~50x real time), so the plan for the live demo is: pre-render once at startup into RAM, stream it through CoreAudio, and drive visuals from its position and FFT (beat-synced camera cuts, light pulses). Size-coding the synth for the 64k build comes after the visuals are settled.
 
 ## Design
 
@@ -76,7 +84,7 @@ Gotchas that cost time, worth knowing:
 2. **Compression.** gzip is only the safe first step. A custom LZ + range coder shaves the constant overhead; study `powernap`.
 3. **Denoiser refinements.** Albedo demodulation and specular-specific filtering; the reflection guide fixed most of the mirror smearing, the remaining softness is in the mirror interior.
 4. **ML denoiser.** A tiny MLP (weights trained offline, embedded) replacing the a-trous passes is the natural "AI" step.
-5. **Synth.** GPU or CoreAudio synthesis, FFT-driven visuals.
+5. **Audio.** Offline render is done; next is CoreAudio playback in the demo and FFT-driven visuals, then size-coding the synth for the 64k build.
 6. **Machine personalization.** powernap-style: username, wallpaper, screen contents baked into the scene.
 7. **Mach-O diet and CI.** `-Os`, `strip -x`, dead-strip unused AppKit paths, inspect with `size -m` / `otool`, run `build.sh --smoke` on a `macos-14` GitHub Actions runner.
 

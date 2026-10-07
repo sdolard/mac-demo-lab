@@ -33,6 +33,7 @@ metal-intro/out/demo --no-denoise     # raw 2 spp for comparison
 metal-intro/out/demo --mode sdf       # raymarched raster fallback
 metal-intro/out/demo --smoke          # offscreen render test, prints fps
 metal-intro/out/demo --shot p.ppm 240 # capture a still, then tools/ppm2png.py
+metal-intro/out/demo --render-audio t.wav  # render the sequenced track to WAV
 sh metal-intro/release.sh             # self-extracting pack, gated at 65536 bytes
 ```
 

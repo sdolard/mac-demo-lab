@@ -2,10 +2,12 @@
 #import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
 #import "renderer.h"
+#import "synth.h"
 #import "shader_source.h"
 #import "pathtracer_source.h"
 
@@ -155,6 +157,32 @@ static NSMenu *MakeMainMenu(void) {
     return menu;
 }
 
+static int RunAudioRender(NSString *path) {
+    Synth synth;
+    synth.renderTrack();
+
+    const float *data = synth.interleaved();
+    size_t frames = synth.frameCount();
+    double peak = 0.0;
+    double sumSquares = 0.0;
+    for (size_t i = 0; i < frames * 2; ++i) {
+        double v = fabs((double)data[i]);
+        if (v > peak) {
+            peak = v;
+        }
+        sumSquares += v * v;
+    }
+    double rms = sqrt(sumSquares / (double)(frames * 2));
+
+    if (!WriteWavPcm16(path.fileSystemRepresentation, data, frames, Synth::kSampleRate)) {
+        fprintf(stderr, "could not write %s\n", path.UTF8String);
+        return 1;
+    }
+    printf("audio: %s (%.1f s, peak %.3f, rms %.3f)\n", path.UTF8String,
+           (double)frames / Synth::kSampleRate, peak, rms);
+    return 0;
+}
+
 static int RunOffscreen(RendererMode mode, NSUInteger frames, NSString *shotPath, NSUInteger spp,
                         BOOL denoise, BOOL move, NSUInteger width, NSUInteger height,
                         double scale) {
@@ -230,6 +258,7 @@ int main(int argc, const char *argv[]) {
         NSUInteger width = 1280;
         NSUInteger height = 720;
         double scale = 0.0;
+        NSString *audioPath = nil;
 
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--smoke") == 0) {
@@ -273,17 +302,23 @@ int main(int argc, const char *argv[]) {
                     fprintf(stderr, "invalid scale (expected > 0 and <= 1, e.g. 0.5)\n");
                     return 2;
                 }
+            } else if (strcmp(argv[i], "--render-audio") == 0 && i + 1 < argc) {
+                audioPath = [NSString stringWithUTF8String:argv[++i]];
             } else if (strcmp(argv[i], "--fullscreen") == 0) {
                 fullscreen = YES;
             } else if (strcmp(argv[i], "--help") == 0) {
                 printf("usage: demo [--mode sdf|pt] [--smoke [frames]] "
                        "[--shot FILE [frames]] [--size WxH] [--scale S] [--spp N] "
-                       "[--no-denoise] [--move] [--fullscreen]\n");
+                       "[--no-denoise] [--move] [--render-audio FILE] [--fullscreen]\n");
                 return 0;
             } else {
                 fprintf(stderr, "unknown argument: %s\n", argv[i]);
                 return 2;
             }
+        }
+
+        if (audioPath) {
+            return RunAudioRender(audioPath);
         }
 
         if (shotPath) {

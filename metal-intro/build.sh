@@ -15,7 +15,7 @@ python3 tools/embed_shader.py src/pathtracer.metal out/pathtracer_source.h kPath
 xcrun clang++ -std=c++17 -fobjc-arc -O2 -Wall -Wextra \
     -Isrc -Iout \
     -o out/demo \
-    src/main.mm src/renderer.mm \
+    src/main.mm src/renderer.mm src/synth.cpp \
     -framework Cocoa -framework Metal -framework MetalKit -framework QuartzCore
 
 echo "built out/demo ($(stat -f%z out/demo) bytes)"
