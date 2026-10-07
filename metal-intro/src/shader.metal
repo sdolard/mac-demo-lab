@@ -87,6 +87,7 @@ vertex float4 vs_fullscreen(uint vertexID [[vertex_id]]) {
 
 fragment float4 fs_scene(float4 position [[position]], constant Uniforms &u [[buffer(0)]]) {
     float2 uv = (position.xy * 2.0 - u.resolution) / u.resolution.y;
+    uv.y = -uv.y;
     float t = u.time;
 
     float3 ro = float3(3.2 * cos(0.25 * t), 1.1 + 0.4 * sin(0.35 * t), 3.2 * sin(0.25 * t));

@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 BUDGET=65536
 
 ./build.sh
+./out/demo --smoke 4 >/dev/null
 
 cp out/demo out/intro
 strip -x out/intro

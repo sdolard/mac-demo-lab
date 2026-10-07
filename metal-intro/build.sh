@@ -9,7 +9,8 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 mkdir -p out
-python3 tools/embed_shader.py src/shader.metal out/shader_source.h
+python3 tools/embed_shader.py src/shader.metal out/shader_source.h kShaderSource
+python3 tools/embed_shader.py src/pathtracer.metal out/pathtracer_source.h kPathTracerSource
 
 xcrun clang++ -std=c++17 -fobjc-arc -O2 -Wall -Wextra \
     -Isrc -Iout \
