@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shader pad</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  #gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #editor {
+    position: fixed; left: 0; right: 0; bottom: 0; height: 40%;
+    margin: 0; padding: 10px 12px; border: 0; outline: none; resize: none;
+    box-sizing: border-box; background: rgba(10, 12, 16, 0.85); color: #cfe8ff;
+    font: 13px/1.45 "SF Mono", Menlo, Consolas, monospace; tab-size: 4;
+  }
+  #err {
+    position: fixed; top: 0; left: 0; right: 0; max-height: 32%;
+    margin: 0; padding: 8px 12px; overflow: auto; display: none;
+    background: rgba(80, 0, 0, 0.85); color: #ffd9d9;
+    font: 12px/1.4 "SF Mono", Menlo, monospace; white-space: pre-wrap;
+  }
+  #hud {
+    position: fixed; top: 8px; left: 10px; color: #7f9dff;
+    font: 12px "SF Mono", Menlo, monospace; text-shadow: 0 0 6px #000;
+    pointer-events: none;
+  }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hud">Tab editor &middot; Cmd/Ctrl+Enter run &middot; Space pause &middot; R reset &middot; P preset</div>
+<pre id="err"></pre>
+<textarea id="editor" spellcheck="false" autocomplete="off"></textarea>
+
+<script>
+"use strict";
+
+const VERT = `#version 300 es
+void main() {
+    float x = float((gl_VertexID << 1) & 2);
+    float y = float(gl_VertexID & 2);
+    gl_Position = vec4(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const PRELUDE = `#version 300 es
+precision highp float;
+precision highp int;
+uniform vec2 iResolution;
+uniform float iTime;
+uniform float iTimeDelta;
+uniform int iFrame;
+uniform vec4 iMouse;
+out vec4 padFragColor;
+#define fragColor padFragColor
+#define fragCoord (gl_FragCoord.xy)
+`;
+
+const PLASMA = `// Bonzomatic-compatible template.
+void main() {
+    vec2 uv = (fragCoord * 2.0 - iResolution) / iResolution.y;
+    float t = iTime;
+
+    vec3 col = 0.5 + 0.5 * cos(t + uv.xyx + vec3(0.0, 2.0, 4.0));
+    col *= 0.6 + 0.4 * sin(uv.x * 8.0 + t * 2.0);
+    col *= 1.0 - 0.3 * dot(uv, uv);
+
+    fragColor = vec4(col, 1.0);
+}`;
+
+const WARMUP = `// Warmup: raymarched box + orb over a checker floor.
+float sdBox(vec3 p, vec3 b) {
+    vec3 q = abs(p) - b;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+mat2 rot(float a) {
+    float c = cos(a), s = sin(a);
+    return mat2(c, -s, s, c);
+}
+
+float scene(vec3 p) {
+    vec3 q = p;
+    q.xz *= rot(0.4 * iTime);
+    q.y += 1.0;
+    float box = sdBox(q, vec3(0.8, 0.5, 0.8));
+
+    vec3 c = vec3(1.7 * cos(0.9 * iTime), 0.4 + 0.5 * sin(1.4 * iTime), 1.7 * sin(0.9 * iTime));
+    float orb = length(p - c) - 0.45;
+
+    float floor_ = p.y + 1.5;
+    return min(min(box, orb), floor_);
+}
+
+vec3 calcNormal(vec3 p) {
+    vec2 e = vec2(0.001, 0.0);
+    float d = scene(p);
+    return normalize(vec3(scene(p + e.xyy) - d, scene(p + e.yxy) - d, scene(p + e.yyx) - d));
+}
+
+void main() {
+    vec2 uv = (fragCoord * 2.0 - iResolution) / iResolution.y;
+    float t = iTime;
+
+    vec3 ro = vec3(3.2 * cos(0.25 * t), 1.1 + 0.4 * sin(0.35 * t), 3.2 * sin(0.25 * t));
+    vec3 f = normalize(-ro);
+    vec3 r = normalize(cross(f, vec3(0.0, 1.0, 0.0)));
+    vec3 u = cross(r, f);
+    vec3 rd = normalize(uv.x * r + uv.y * u + 1.6 * f);
+
+    vec3 col = mix(vec3(0.10, 0.08, 0.16), vec3(0.02, 0.03, 0.08), clamp(0.5 + 0.5 * rd.y, 0.0, 1.0));
+
+    float d = 0.0;
+    for (int i = 0; i < 96; i++) {
+        float h = scene(ro + rd * d);
+        if (h < 0.001 || d > 40.0) break;
+        d += h;
+    }
+
+    if (d < 40.0) {
+        vec3 p = ro + rd * d;
+        vec3 n = calcNormal(p);
+
+        vec3 key = normalize(vec3(0.6, 0.7, -0.4));
+        float diff = max(dot(n, key), 0.0);
+        float rim = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
+
+        vec3 base = vec3(0.9);
+        if (p.y < -1.49) {
+            float ch = mod(floor(p.x) + floor(p.z), 2.0);
+            base = mix(vec3(0.15, 0.16, 0.20), vec3(0.55, 0.56, 0.60), ch);
+        }
+
+        vec3 lit = base * diff * vec3(1.0, 0.93, 0.82);
+        lit += base * 0.25;
+        lit += rim * vec3(0.3, 0.5, 0.9);
+        col = mix(col, lit, exp(-0.02 * d * d));
+    }
+
+    col = pow(clamp(col, 0.0, 1.0), vec3(0.4545));
+    col *= 1.0 - 0.25 * dot(uv, uv);
+    fragColor = vec4(col, 1.0);
+}`;
+
+const PRESETS = [PLASMA, WARMUP];
+
+const canvas = document.getElementById("gl");
+const editor = document.getElementById("editor");
+const errPane = document.getElementById("err");
+const hud = document.getElementById("hud");
+
+const gl = canvas.getContext("webgl2", { antialias: false });
+if (!gl) {
+    errPane.style.display = "block";
+    errPane.textContent = "WebGL2 not available in this browser.";
+    throw new Error("no webgl2");
+}
+
+function compile(type, source) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, source);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        const log = gl.getShaderInfoLog(sh);
+        gl.deleteShader(sh);
+        return { error: log };
+    }
+    return { shader: sh };
+}
+
+function buildProgram(fragmentSource) {
+    const vs = compile(gl.VERTEX_SHADER, VERT);
+    if (vs.error) return { error: "vertex: " + vs.error };
+    const fs = compile(gl.FRAGMENT_SHADER, PRELUDE + fragmentSource);
+    if (fs.error) {
+        gl.deleteShader(vs.shader);
+        return { error: fs.error };
+    }
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs.shader);
+    gl.attachShader(prog, fs.shader);
+    gl.linkProgram(prog);
+    gl.deleteShader(vs.shader);
+    gl.deleteShader(fs.shader);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        const log = gl.getProgramInfoLog(prog);
+        gl.deleteProgram(prog);
+        return { error: "link: " + log };
+    }
+    return {
+        program: prog,
+        uResolution: gl.getUniformLocation(prog, "iResolution"),
+        uTime: gl.getUniformLocation(prog, "iTime"),
+        uTimeDelta: gl.getUniformLocation(prog, "iTimeDelta"),
+        uFrame: gl.getUniformLocation(prog, "iFrame"),
+        uMouse: gl.getUniformLocation(prog, "iMouse"),
+    };
+}
+
+let current = null;
+
+function run() {
+    const result = buildProgram(editor.value);
+    if (result.error) {
+        errPane.textContent = result.error;
+        errPane.style.display = "block";
+        return false;
+    }
+    if (current) gl.deleteProgram(current.program);
+    current = result;
+    errPane.style.display = "none";
+    localStorage.setItem("shaderpad.src", editor.value);
+    return true;
+}
+
+editor.value = localStorage.getItem("shaderpad.src") || PRESETS[0];
+run();
+
+editor.addEventListener("input", () => localStorage.setItem("shaderpad.src", editor.value));
+
+let paused = false;
+let time = 0;
+let frame = 0;
+let presetIndex = 0;
+let last = performance.now();
+const mouse = [0, 0, 0, 0];
+
+function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.floor(innerWidth * dpr);
+    canvas.height = Math.floor(innerHeight * dpr);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+}
+addEventListener("resize", resize);
+resize();
+
+canvas.addEventListener("pointermove", (e) => {
+    mouse[0] = e.clientX * (canvas.width / innerWidth);
+    mouse[1] = canvas.height - e.clientY * (canvas.height / innerHeight);
+});
+canvas.addEventListener("pointerdown", () => {
+    mouse[2] = mouse[0];
+    mouse[3] = mouse[1];
+});
+
+function tick(now) {
+    const dt = Math.min((now - last) / 1000, 0.1);
+    last = now;
+    if (!paused) time += dt;
+
+    gl.useProgram(current.program);
+    gl.uniform2f(current.uResolution, canvas.width, canvas.height);
+    gl.uniform1f(current.uTime, time);
+    gl.uniform1f(current.uTimeDelta, paused ? 0 : dt);
+    gl.uniform1i(current.uFrame, frame);
+    gl.uniform4f(current.uMouse, mouse[0], mouse[1], mouse[2], mouse[3]);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    frame++;
+    requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+function resetTime() {
+    time = 0;
+    frame = 0;
+    last = performance.now();
+}
+
+editor.addEventListener("keydown", (e) => {
+    if (e.key === "Tab") {
+        e.preventDefault();
+        editor.classList.toggle("hidden");
+        hud.classList.toggle("hidden");
+    } else if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        run();
+    }
+});
+
+addEventListener("keydown", (e) => {
+    const typing = document.activeElement === editor;
+    if (typing) return;
+    if (e.key === "Tab") {
+        e.preventDefault();
+        editor.classList.toggle("hidden");
+        hud.classList.toggle("hidden");
+    } else if (e.key === " ") {
+        e.preventDefault();
+        paused = !paused;
+    } else if (e.key === "r" || e.key === "R") {
+        resetTime();
+    } else if (e.key === "p" || e.key === "P") {
+        presetIndex = (presetIndex + 1) % PRESETS.length;
+        editor.value = PRESETS[presetIndex];
+        resetTime();
+        run();
+    }
+});
+</script>
+</body>
+</html>
