@@ -48,6 +48,7 @@ static const char *NameForMode(RendererMode mode) {
 @property (nonatomic) BOOL startFullscreen;
 @property (nonatomic) RendererMode mode;
 @property (nonatomic) NSUInteger samplesPerFrame;
+@property (nonatomic) double renderScale;
 @property (nonatomic) BOOL denoiseEnabled;
 @property (nonatomic) BOOL continuousMotion;
 @property (nonatomic) NSUInteger fpsFrames;
@@ -96,6 +97,9 @@ static const char *NameForMode(RendererMode mode) {
 
     if (self.samplesPerFrame > 0) {
         self.renderer.samplesPerFrame = self.samplesPerFrame;
+    }
+    if (self.renderScale > 0.0) {
+        self.renderer.renderScale = self.renderScale;
     }
     self.renderer.denoiseEnabled = self.denoiseEnabled;
     self.renderer.continuousMotion = self.continuousMotion;
@@ -152,7 +156,8 @@ static NSMenu *MakeMainMenu(void) {
 }
 
 static int RunOffscreen(RendererMode mode, NSUInteger frames, NSString *shotPath, NSUInteger spp,
-                        BOOL denoise, BOOL move) {
+                        BOOL denoise, BOOL move, NSUInteger width, NSUInteger height,
+                        double scale) {
     if (shotPath && mode != RendererModePathTracer) {
         fprintf(stderr, "--shot is only supported with --mode pt\n");
         return 2;
@@ -178,6 +183,9 @@ static int RunOffscreen(RendererMode mode, NSUInteger frames, NSString *shotPath
     if (spp > 0) {
         renderer.samplesPerFrame = spp;
     }
+    if (scale > 0.0) {
+        renderer.renderScale = scale;
+    }
     renderer.denoiseEnabled = denoise;
     renderer.continuousMotion = move;
 
@@ -186,7 +194,7 @@ static int RunOffscreen(RendererMode mode, NSUInteger frames, NSString *shotPath
     }
 
     double startTime = CACurrentMediaTime();
-    if (![renderer renderOffscreenFrames:frames error:&error]) {
+    if (![renderer renderOffscreenFrames:frames width:width height:height error:&error]) {
         fprintf(stderr, "offscreen render failed: %s\n", error.localizedDescription.UTF8String);
         return 1;
     }
@@ -219,6 +227,9 @@ int main(int argc, const char *argv[]) {
         NSUInteger spp = 0;
         BOOL denoise = YES;
         BOOL move = NO;
+        NSUInteger width = 1280;
+        NSUInteger height = 720;
+        double scale = 0.0;
 
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--smoke") == 0) {
@@ -247,11 +258,27 @@ int main(int argc, const char *argv[]) {
                 denoise = NO;
             } else if (strcmp(argv[i], "--move") == 0) {
                 move = YES;
+            } else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
+                unsigned int w = 0;
+                unsigned int h = 0;
+                if (sscanf(argv[++i], "%ux%u", &w, &h) != 2 || w == 0 || h == 0) {
+                    fprintf(stderr, "invalid size (expected WxH, e.g. 2560x1440)\n");
+                    return 2;
+                }
+                width = w;
+                height = h;
+            } else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) {
+                scale = atof(argv[++i]);
+                if (scale <= 0.0 || scale > 1.0) {
+                    fprintf(stderr, "invalid scale (expected > 0 and <= 1, e.g. 0.5)\n");
+                    return 2;
+                }
             } else if (strcmp(argv[i], "--fullscreen") == 0) {
                 fullscreen = YES;
             } else if (strcmp(argv[i], "--help") == 0) {
                 printf("usage: demo [--mode sdf|pt] [--smoke [frames]] "
-                       "[--shot FILE [frames]] [--spp N] [--no-denoise] [--move] [--fullscreen]\n");
+                       "[--shot FILE [frames]] [--size WxH] [--scale S] [--spp N] "
+                       "[--no-denoise] [--move] [--fullscreen]\n");
                 return 0;
             } else {
                 fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -260,10 +287,10 @@ int main(int argc, const char *argv[]) {
         }
 
         if (shotPath) {
-            return RunOffscreen(mode, shotFrames, shotPath, spp, denoise, move);
+            return RunOffscreen(mode, shotFrames, shotPath, spp, denoise, move, width, height, scale);
         }
         if (smoke) {
-            return RunOffscreen(mode, smokeFrames, nil, spp, denoise, move);
+            return RunOffscreen(mode, smokeFrames, nil, spp, denoise, move, width, height, scale);
         }
 
         NSApplication *app = [NSApplication sharedApplication];
@@ -272,7 +299,8 @@ int main(int argc, const char *argv[]) {
         AppDelegate *delegate = [[AppDelegate alloc] init];
         delegate.startFullscreen = fullscreen;
         delegate.mode = mode;
-        delegate.samplesPerFrame = spp;
+        delegate.samplesPerFrame = spp > 0 ? spp : 8;
+        delegate.renderScale = scale > 0.0 ? scale : 0.5;
         delegate.denoiseEnabled = denoise;
         delegate.continuousMotion = move;
         app.delegate = delegate;

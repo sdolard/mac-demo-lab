@@ -1,5 +1,6 @@
 #import "renderer.h"
 #import <QuartzCore/QuartzCore.h>
+#import <simd/simd.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -12,13 +13,14 @@ typedef struct {
 } SDFUniforms;
 
 typedef struct __attribute__((aligned(16))) {
-    float resolution[2];
+    simd_float2 resolution;
+    simd_float2 outputResolution;
     float time;
     float frame;
-    float cameraPos[4];
-    float cameraTarget[4];
-    float prevCameraPos[4];
-    float prevCameraTarget[4];
+    simd_float4 cameraPos;
+    simd_float4 cameraTarget;
+    simd_float4 prevCameraPos;
+    simd_float4 prevCameraTarget;
     uint32_t frameSeed;
     uint32_t samplesPerFrame;
     uint32_t resetHistory;
@@ -68,11 +70,14 @@ static NSError *MakeError(NSInteger code, NSString *message) {
     id<MTLTexture> _histCur;
     id<MTLTexture> _histPrev;
     id<MTLTexture> _moments;
+    id<MTLTexture> _guide;
     id<MTLTexture> _filtA;
     id<MTLTexture> _filtB;
     id<MTLTexture> _displayTexture;
     NSUInteger _bufferWidth;
     NSUInteger _bufferHeight;
+    NSUInteger _outputWidth;
+    NSUInteger _outputHeight;
 
     BOOL _hasPrevCamera;
     CameraPose _prevCamera;
@@ -100,6 +105,7 @@ static NSError *MakeError(NSInteger code, NSString *message) {
     _samplesPerFrame = 2;
     _denoiseEnabled = YES;
     _continuousMotion = NO;
+    _renderScale = 1.0;
     _device = device;
     _startTime = CACurrentMediaTime();
 
@@ -250,10 +256,12 @@ static NSError *MakeError(NSInteger code, NSString *message) {
     _histA = [_device newTextureWithDescriptor:descriptor];
     _histB = [_device newTextureWithDescriptor:descriptor];
     _moments = [_device newTextureWithDescriptor:descriptor];
+    _guide = [_device newTextureWithDescriptor:descriptor];
     _filtA = [_device newTextureWithDescriptor:descriptor];
     _filtB = [_device newTextureWithDescriptor:descriptor];
 
-    if (!_radiance || !_gA || !_gB || !_histA || !_histB || !_moments || !_filtA || !_filtB) {
+    if (!_radiance || !_gA || !_gB || !_histA || !_histB || !_moments || !_guide ||
+        !_filtA || !_filtB) {
         return NO;
     }
 
@@ -287,7 +295,10 @@ static NSError *MakeError(NSInteger code, NSString *message) {
     return kShots[shot];
 }
 
-- (PTUniforms)nextPTUniformsForWidth:(NSUInteger)width height:(NSUInteger)height {
+- (PTUniforms)nextPTUniformsForWidth:(NSUInteger)width
+                              height:(NSUInteger)height
+                       outputWidth:(NSUInteger)outputWidth
+                      outputHeight:(NSUInteger)outputHeight {
     PTUniforms u;
     memset(&u, 0, sizeof(u));
 
@@ -299,6 +310,8 @@ static NSError *MakeError(NSInteger code, NSString *message) {
 
     u.resolution[0] = (float)width;
     u.resolution[1] = (float)height;
+    u.outputResolution[0] = (float)outputWidth;
+    u.outputResolution[1] = (float)outputHeight;
     u.time = (float)now;
     u.frame = (float)_ptFrameCount;
     u.cameraPos[0] = pose.px;
@@ -328,19 +341,30 @@ static NSError *MakeError(NSInteger code, NSString *message) {
                           renderPassDescriptor:(MTLRenderPassDescriptor *)pass
 {
     id<MTLTexture> target = pass.colorAttachments[0].texture;
-    if (![self ensurePathTracerBuffersForWidth:target.width height:target.height]) {
+    NSUInteger renderWidth = (NSUInteger)lround((double)target.width * _renderScale);
+    NSUInteger renderHeight = (NSUInteger)lround((double)target.height * _renderScale);
+    renderWidth = MAX(renderWidth, 1);
+    renderHeight = MAX(renderHeight, 1);
+    if (![self ensurePathTracerBuffersForWidth:renderWidth height:renderHeight]) {
         return;
     }
 
-    PTUniforms uniforms = [self nextPTUniformsForWidth:target.width height:target.height];
+    _outputWidth = target.width;
+    _outputHeight = target.height;
+
+    PTUniforms uniforms = [self nextPTUniformsForWidth:renderWidth
+                                                height:renderHeight
+                                           outputWidth:target.width
+                                          outputHeight:target.height];
     MTLSize threadsPerGroup = MTLSizeMake(8, 8, 1);
-    MTLSize groups = MTLSizeMake((target.width + 7) / 8, (target.height + 7) / 8, 1);
+    MTLSize groups = MTLSizeMake((renderWidth + 7) / 8, (renderHeight + 7) / 8, 1);
 
     id<MTLComputeCommandEncoder> compute = [commandBuffer computeCommandEncoder];
 
     [compute setComputePipelineState:_tracePipeline];
     [compute setTexture:_radiance atIndex:0];
     [compute setTexture:_gCur atIndex:1];
+    [compute setTexture:_guide atIndex:2];
     [compute setBytes:&uniforms length:sizeof(uniforms) atIndex:0];
     [compute dispatchThreadgroups:groups threadsPerThreadgroup:threadsPerGroup];
     [compute memoryBarrierWithScope:MTLBarrierScopeTextures];
@@ -366,6 +390,7 @@ static NSError *MakeError(NSInteger code, NSString *message) {
             [compute setTexture:_gCur atIndex:1];
             [compute setTexture:_moments atIndex:2];
             [compute setTexture:destination[iteration % 2] atIndex:3];
+            [compute setTexture:_guide atIndex:4];
             [compute setBytes:&uniforms length:sizeof(uniforms) atIndex:0];
             [compute dispatchThreadgroups:groups threadsPerThreadgroup:threadsPerGroup];
             [compute memoryBarrierWithScope:MTLBarrierScopeTextures];
@@ -419,11 +444,14 @@ static NSError *MakeError(NSInteger code, NSString *message) {
     [commandBuffer commit];
 }
 
-- (BOOL)renderOffscreenFrames:(NSUInteger)count error:(NSError **)error {
+- (BOOL)renderOffscreenFrames:(NSUInteger)count
+                        width:(NSUInteger)width
+                       height:(NSUInteger)height
+                        error:(NSError **)error {
     MTLTextureDescriptor *textureDescriptor =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                           width:1280
-                                                          height:720
+                                                           width:width
+                                                          height:height
                                                        mipmapped:NO];
     textureDescriptor.usage = MTLTextureUsageRenderTarget;
     id<MTLTexture> texture = [_device newTextureWithDescriptor:textureDescriptor];
@@ -465,8 +493,8 @@ static NSError *MakeError(NSInteger code, NSString *message) {
         return NO;
     }
 
-    NSUInteger width = _displayTexture.width;
-    NSUInteger height = _displayTexture.height;
+    NSUInteger width = _outputWidth > 0 ? _outputWidth : _displayTexture.width;
+    NSUInteger height = _outputHeight > 0 ? _outputHeight : _displayTexture.height;
 
     MTLTextureDescriptor *descriptor =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -485,8 +513,10 @@ static NSError *MakeError(NSInteger code, NSString *message) {
 
     PTUniforms uniforms;
     memset(&uniforms, 0, sizeof(uniforms));
-    uniforms.resolution[0] = (float)width;
-    uniforms.resolution[1] = (float)height;
+    uniforms.resolution[0] = (float)_displayTexture.width;
+    uniforms.resolution[1] = (float)_displayTexture.height;
+    uniforms.outputResolution[0] = (float)width;
+    uniforms.outputResolution[1] = (float)height;
     uniforms.exposure = 1.0f;
 
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];

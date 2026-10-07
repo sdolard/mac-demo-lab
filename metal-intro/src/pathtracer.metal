@@ -5,14 +5,16 @@ constant float kPi = 3.14159265358979323846;
 constant float3 kLightPos = float3(0.0, 2.35, 0.0);
 constant float kLightRadius = 0.25;
 constant float kLightEmission = 13.0;
-constant float kFireflyClamp = 6.0;
+constant float kFireflyClamp = 4.0;
 constant float kIor = 1.5;
 constant float3 kRoomMin = float3(-2.5, 0.0, -2.5);
 constant float3 kRoomMax = float3(2.5, 3.0, 2.5);
 constant uint kMaxHistory = 16;
+constant sampler kLinearSampler(coord::normalized, filter::linear, address::clamp_to_edge);
 
 struct PTUniforms {
     float2 resolution;
+    float2 outputResolution;
     float  time;
     float  frame;
     float4 cameraPos;
@@ -207,6 +209,7 @@ static float3 rayDirection(uint2 gid, float2 jitter, constant PTUniforms &u) {
 
 kernel void cs_pathtrace(texture2d<float, access::write> radiance [[texture(0)]],
                          texture2d<float, access::write> gbuffer [[texture(1)]],
+                         texture2d<float, access::write> guide [[texture(2)]],
                          constant PTUniforms &u [[buffer(0)]],
                          uint2 gid [[thread_position_in_grid]]) {
     uint2 size = uint2(u.resolution);
@@ -311,19 +314,57 @@ kernel void cs_pathtrace(texture2d<float, access::write> radiance [[texture(0)]]
     bool primaryScene = trace(primary, primaryHit);
 
     float4 g = float4(0.0);
+    float guideDistance = 0.0;
     if (primaryLight && (!primaryScene || primaryLightT < primaryHit.t)) {
         float3 p = primary.o + primary.d * primaryLightT;
         g = float4(normalize(p - kLightPos), primaryLightT);
+        guideDistance = primaryLightT;
     } else if (primaryScene) {
         g = float4(primaryHit.n, primaryHit.t);
+        guideDistance = primaryHit.t;
+
+        Ray secondary;
+        secondary.o = primaryHit.p;
+        bool secondaryValid = false;
+        if (primaryHit.mat == 1) {
+            secondary.o += primaryHit.n * 1e-3;
+            secondary.d = reflect(primary.d, primaryHit.n);
+            secondaryValid = true;
+        } else if (primaryHit.mat == 2) {
+            bool entering = dot(primary.d, primaryHit.n) < 0.0;
+            float3 nl = entering ? primaryHit.n : -primaryHit.n;
+            float eta = entering ? (1.0 / kIor) : kIor;
+            float3 refracted = refract(primary.d, nl, eta);
+            if (length_squared(refracted) < 0.5) {
+                refracted = reflect(primary.d, nl);
+            }
+            secondary.o += refracted * 1e-3;
+            secondary.d = refracted;
+            secondaryValid = true;
+        }
+
+        if (secondaryValid) {
+            Hit secondaryHit;
+            float secondaryLightT = 0.0;
+            bool secondaryLight = intersectSphere(secondary, kLightPos, kLightRadius, secondaryLightT);
+            bool secondaryScene = trace(secondary, secondaryHit);
+            if (secondaryLight && (!secondaryScene || secondaryLightT < secondaryHit.t)) {
+                guideDistance = secondaryLightT;
+            } else if (secondaryScene) {
+                guideDistance = secondaryHit.t;
+            } else {
+                guideDistance = 1e3;
+            }
+        }
     }
     gbuffer.write(g, gid);
+    guide.write(float4(guideDistance, 0.0, 0.0, 1.0), gid);
 }
 
 kernel void cs_temporal(texture2d<float, access::read> radiance [[texture(0)]],
                         texture2d<float, access::read> gCur [[texture(1)]],
                         texture2d<float, access::read> gPrev [[texture(2)]],
-                        texture2d<float, access::read> histIn [[texture(3)]],
+                        texture2d<float> histIn [[texture(3)]],
                         texture2d<float, access::read_write> moments [[texture(4)]],
                         texture2d<float, access::write> histOut [[texture(5)]],
                         constant PTUniforms &u [[buffer(0)]],
@@ -342,6 +383,8 @@ kernel void cs_temporal(texture2d<float, access::read> radiance [[texture(0)]],
     float3 n = g.xyz;
 
     bool valid = false;
+    float2 reprojected = float2(gid);
+    float3 historyColor = float3(0.0);
     if (depth > 0.0 && u.resetHistory == 0) {
         float2 raw = (float2(gid) + 0.5 - u.resolution * 0.5) / u.resolution.y;
         float2 uv = float2(raw.x, -raw.y);
@@ -359,30 +402,83 @@ kernel void cs_temporal(texture2d<float, access::read> radiance [[texture(0)]],
             float2 puv = float2(dot(rel, pright), dot(rel, pup)) / z * 1.7;
             float2 praw = float2(puv.x, -puv.y);
             float2 pixel = praw * u.resolution.y + u.resolution * 0.5 - 0.5;
-            int2 ip = int2(round(pixel));
-            if (ip.x >= 0 && ip.y >= 0 && ip.x < int(size.x) && ip.y < int(size.y)) {
-                float4 pg = gPrev.read(uint2(ip));
-                float3 pn = pg.xyz;
-                float pd = pg.w;
-                if (pd > 0.0 && dot(normalize(n), normalize(pn)) > 0.9 &&
-                    abs(pd - depth) < 0.05 * depth) {
-                    valid = true;
+            reprojected = pixel;
+
+            int2 base = int2(floor(pixel));
+            float2 frac = pixel - float2(base);
+            float3 unitNormal = normalize(n);
+            float weightSum = 0.0;
+            float3 accumulated = float3(0.0);
+            for (int j = 0; j <= 1; ++j) {
+                for (int i = 0; i <= 1; ++i) {
+                    int2 q = base + int2(i, j);
+                    if (q.x < 0 || q.y < 0 || q.x >= int(size.x) || q.y >= int(size.y)) {
+                        continue;
+                    }
+                    float4 pg = gPrev.read(uint2(q));
+                    if (pg.w <= 0.0 || dot(unitNormal, normalize(pg.xyz)) <= 0.9 ||
+                        abs(pg.w - depth) >= 0.05 * depth) {
+                        continue;
+                    }
+                    float bw = (i == 0 ? 1.0 - frac.x : frac.x) * (j == 0 ? 1.0 - frac.y : frac.y);
+                    accumulated += histIn.read(uint2(q)).rgb * bw;
+                    weightSum += bw;
                 }
+            }
+            if (weightSum > 0.0) {
+                historyColor = accumulated / weightSum;
+                valid = true;
             }
         }
     }
 
-    float4 hist = histIn.read(gid);
-    float len = valid ? hist.a : 0.0;
-    float alpha = max(1.0 / (len + 1.0), 1.0 / (float(kMaxHistory) + 1.0));
+    float4 histNearest = histIn.read(gid);
+    float len = valid ? histNearest.a : 0.0;
+    float variancePrev = max(0.0, mom.y - mom.x * mom.x);
+    float alphaMin = 1.0 / (float(kMaxHistory) + 1.0);
+    if (valid) {
+        float motion = length(reprojected - float2(gid));
+        alphaMin = clamp(max(motion * 0.12, motion * sqrt(variancePrev) * 2.0),
+                         alphaMin, 0.5);
+    }
+    float alpha = max(1.0 / (len + 1.0), alphaMin);
+
+    float3 sample = curr;
+    float sampleLum = lum;
+    if (valid && len > 0.0) {
+        float sigma = sqrt(max(0.0, mom.y - mom.x * mom.x));
+        float low = mom.x - 3.0 * sigma;
+        float high = mom.x + 3.0 * sigma;
+        if (sampleLum > high) {
+            sample *= high / max(sampleLum, 1e-5);
+        } else if (sampleLum < low) {
+            sample *= low / max(sampleLum, 1e-5);
+        }
+    }
+
+    float3 neighbourhoodMin = float3(1e30);
+    float3 neighbourhoodMax = float3(-1e30);
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            if (i == 0 && j == 0) {
+                continue;
+            }
+            int2 q = clamp(int2(gid) + int2(i, j), int2(0), int2(size) - 1);
+            float3 neighbour = radiance.read(uint2(q)).rgb;
+            neighbourhoodMin = min(neighbourhoodMin, neighbour);
+            neighbourhoodMax = max(neighbourhoodMax, neighbour);
+        }
+    }
+    sample = clamp(sample, neighbourhoodMin, neighbourhoodMax);
+    sampleLum = luminance(sample);
 
     if (!valid || len <= 0.0) {
-        histOut.write(float4(curr, 1.0), gid);
-        moments.write(float4(lum, lum * lum, 0.0, 0.0), gid);
+        histOut.write(float4(sample, 1.0), gid);
+        moments.write(float4(sampleLum, sampleLum * sampleLum, 0.0, 0.0), gid);
     } else {
-        float3 color = mix(hist.rgb, curr, alpha);
-        float mean = mix(mom.x, lum, alpha);
-        float meanSq = mix(mom.y, lum * lum, alpha);
+        float3 color = mix(historyColor, sample, alpha);
+        float mean = mix(mom.x, sampleLum, alpha);
+        float meanSq = mix(mom.y, sampleLum * sampleLum, alpha);
         histOut.write(float4(color, min(len + 1.0, float(kMaxHistory))), gid);
         moments.write(float4(mean, meanSq, 0.0, 0.0), gid);
     }
@@ -392,6 +488,7 @@ kernel void cs_atrous(texture2d<float, access::read> source [[texture(0)]],
                       texture2d<float, access::read> gbuffer [[texture(1)]],
                       texture2d<float, access::read> moments [[texture(2)]],
                       texture2d<float, access::write> dest [[texture(3)]],
+                      texture2d<float, access::read> guide [[texture(4)]],
                       constant PTUniforms &u [[buffer(0)]],
                       uint2 gid [[thread_position_in_grid]]) {
     uint2 size = uint2(u.resolution);
@@ -402,11 +499,12 @@ kernel void cs_atrous(texture2d<float, access::read> source [[texture(0)]],
     float4 g0 = gbuffer.read(gid);
     float z0 = g0.w;
     float3 n0 = normalize(g0.xyz + 1e-6);
+    float guide0 = guide.read(gid).x;
     float3 c0 = source.read(gid).rgb;
     float lum0 = luminance(c0);
     float4 mom = moments.read(gid);
     float variance = max(0.0, mom.y - mom.x * mom.x);
-    float sigmaL = 0.6 * sqrt(variance) + 0.02;
+    float sigmaL = min(0.35 * sqrt(variance) + 0.01, 0.15);
 
     float3 sum = c0;
     float wsum = 1.0;
@@ -427,11 +525,16 @@ kernel void cs_atrous(texture2d<float, access::read> source [[texture(0)]],
             float3 nq = normalize(gq.xyz + 1e-6);
             float3 cq = source.read(uint2(p)).rgb;
             float lumq = luminance(cq);
+            float guideq = guide.read(uint2(p)).x;
 
             float wz = exp(-abs(z0 - zq) / (0.15 * z0));
             float wn = pow(max(0.0, dot(n0, nq)), 16.0);
             float wl = exp(-abs(lum0 - lumq) / sigmaL);
-            float w = wz * wn * wl;
+            float wg = 1.0;
+            if (guide0 > 0.0 && guideq > 0.0) {
+                wg = exp(-abs(guide0 - guideq) / (0.1 * max(guide0, 0.1)));
+            }
+            float w = wz * wn * wl * wg;
 
             sum += cq * w;
             wsum += w;
@@ -449,8 +552,9 @@ vertex float4 vs_fullscreen(uint vertexID [[vertex_id]]) {
 fragment float4 fs_display(float4 position [[position]],
                            constant PTUniforms &u [[buffer(0)]],
                            texture2d<float> color [[texture(0)]]) {
-    uint2 coord = uint2(position.xy);
-    float3 c = color.read(coord).rgb * u.exposure;
+    constexpr sampler linearSampler(coord::normalized, filter::linear, address::clamp_to_edge);
+    float2 uv = position.xy / u.outputResolution;
+    float3 c = color.sample(linearSampler, uv).rgb * u.exposure;
     c = (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14);
     c = pow(clamp(c, 0.0, 1.0), float3(1.0 / 2.2));
     return float4(c, 1.0);

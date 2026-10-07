@@ -52,4 +52,4 @@ sh metal-intro/release.sh             # self-extracting pack, gated at 65536 byt
 
 ## Status
 
-Scaffold. The Metal renderer embeds MSL source and compiles it at runtime so it builds with the Xcode Command Line Tools alone; the path tracer with the SVGF-style denoiser runs at ~275 fps offscreen (display-capped at 60 windowed) on an M4 Pro, and its packed release fits in 36% of the 64 KiB budget. The size-coding path (offline `metallib`, self-compression, synth) is the roadmap; see `metal-intro/README.md`.
+Scaffold. The Metal renderer embeds MSL source and compiles it at runtime so it builds with the Xcode Command Line Tools alone; the path tracer with the SVGF-style denoiser (temporal reprojection + reflection-guided a-trous) holds 60 fps windowed at 1440p on an M4 Pro, and its packed release fits in 38.5% of the 64 KiB budget. The size-coding path (offline `metallib`, self-compression, audio) is the roadmap; see `metal-intro/README.md`.
