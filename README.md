@@ -7,7 +7,7 @@ No emulators, no porting: everything here runs natively on Apple Silicon.
 | Track | What | Compete in |
 |---|---|---|
 | [`shader-showdown/`](shader-showdown/) | Live-coded GLSL with Bonzomatic, plus a zero-install WebGL2 practice pad | Revision Shader Showdown / Shader Royale, livecoding events |
-| [`metal-intro/`](metal-intro/) | Native Apple Silicon Metal scaffold: compute path tracer (Cornell box, chrome + glass, progressive accumulation) heading for a 4k/64k intro | 4k/64k intro compos, Wild compo |
+| [`metal-intro/`](metal-intro/) | Native Apple Silicon Metal scaffold: compute path tracer with an SVGF-style denoiser and continuous camera motion, heading for a 4k/64k intro | 4k/64k intro compos, Wild compo |
 
 ## Quickstart
 
@@ -27,9 +27,11 @@ Metal intro scaffold:
 
 ```sh
 sh metal-intro/build.sh
-metal-intro/out/demo                  # path tracer, f fullscreen, p pause, ESC quit
+metal-intro/out/demo                  # denoised path tracer, f fullscreen, p pause, ESC quit
+metal-intro/out/demo --move           # continuous camera motion
+metal-intro/out/demo --no-denoise     # raw 2 spp for comparison
 metal-intro/out/demo --mode sdf       # raymarched raster fallback
-metal-intro/out/demo --smoke          # offscreen render test
+metal-intro/out/demo --smoke          # offscreen render test, prints fps
 metal-intro/out/demo --shot p.ppm 240 # capture a still, then tools/ppm2png.py
 sh metal-intro/release.sh             # self-extracting pack, gated at 65536 bytes
 ```
@@ -50,4 +52,4 @@ sh metal-intro/release.sh             # self-extracting pack, gated at 65536 byt
 
 ## Status
 
-Scaffold. The Metal renderer embeds MSL source and compiles it at runtime so it builds with the Xcode Command Line Tools alone; the path tracer runs at 60 fps windowed on an M4 Pro and its packed release fits in 29% of the 64 KiB budget. The size-coding path (offline `metallib`, self-compression, denoiser, synth) is the roadmap; see `metal-intro/README.md`.
+Scaffold. The Metal renderer embeds MSL source and compiles it at runtime so it builds with the Xcode Command Line Tools alone; the path tracer with the SVGF-style denoiser runs at ~275 fps offscreen (display-capped at 60 windowed) on an M4 Pro, and its packed release fits in 36% of the 64 KiB budget. The size-coding path (offline `metallib`, self-compression, synth) is the roadmap; see `metal-intro/README.md`.

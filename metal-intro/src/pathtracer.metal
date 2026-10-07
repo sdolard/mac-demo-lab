@@ -9,6 +9,7 @@ constant float kFireflyClamp = 6.0;
 constant float kIor = 1.5;
 constant float3 kRoomMin = float3(-2.5, 0.0, -2.5);
 constant float3 kRoomMax = float3(2.5, 3.0, 2.5);
+constant uint kMaxHistory = 16;
 
 struct PTUniforms {
     float2 resolution;
@@ -16,10 +17,16 @@ struct PTUniforms {
     float  frame;
     float4 cameraPos;
     float4 cameraTarget;
-    uint   sampleIndex;
+    float4 prevCameraPos;
+    float4 prevCameraTarget;
     uint   frameSeed;
-    float  exposure;
     uint   samplesPerFrame;
+    uint   resetHistory;
+    uint   filterStep;
+    float  exposure;
+    float  pad0;
+    float  pad1;
+    float  pad2;
 };
 
 struct Ray {
@@ -44,6 +51,10 @@ static uint pcgHash(uint v) {
 static float rand01(thread uint &rng) {
     rng = pcgHash(rng);
     return float(rng) * (1.0 / 4294967296.0);
+}
+
+static float luminance(float3 c) {
+    return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
 static float3 cosineHemisphere(float3 n, thread uint &rng) {
@@ -184,7 +195,18 @@ static void sampleLight(float3 p, thread float3 &wi, thread float &dist, thread 
     cosLight = dot(-wi, (q - kLightPos) / kLightRadius);
 }
 
-kernel void cs_pathtrace(texture2d<float, access::read_write> accum [[texture(0)]],
+static float3 rayDirection(uint2 gid, float2 jitter, constant PTUniforms &u) {
+    float2 raw = (float2(gid) + jitter - u.resolution * 0.5) / u.resolution.y;
+    float2 uv = float2(raw.x, -raw.y);
+    float3 ro = u.cameraPos.xyz;
+    float3 forward = normalize(u.cameraTarget.xyz - ro);
+    float3 right = normalize(cross(forward, float3(0.0, 1.0, 0.0)));
+    float3 up = cross(right, forward);
+    return normalize(uv.x * right + uv.y * up + 1.7 * forward);
+}
+
+kernel void cs_pathtrace(texture2d<float, access::write> radiance [[texture(0)]],
+                         texture2d<float, access::write> gbuffer [[texture(1)]],
                          constant PTUniforms &u [[buffer(0)]],
                          uint2 gid [[thread_position_in_grid]]) {
     uint2 size = uint2(u.resolution);
@@ -193,23 +215,16 @@ kernel void cs_pathtrace(texture2d<float, access::read_write> accum [[texture(0)
     }
 
     uint rng = pcgHash(gid.x * 1973u ^ gid.y * 9277u ^ u.frameSeed * 26699u) | 1u;
-
     float3 ro = u.cameraPos.xyz;
-    float3 forward = normalize(u.cameraTarget.xyz - ro);
-    float3 right = normalize(cross(forward, float3(0.0, 1.0, 0.0)));
-    float3 up = cross(right, forward);
-
     uint spp = max(u.samplesPerFrame, 1u);
     float3 sum = float3(0.0);
 
     for (uint sample = 0; sample < spp; ++sample) {
         float2 jitter = float2(rand01(rng), rand01(rng));
-        float2 uv = (float2(gid) + jitter - u.resolution * 0.5) / u.resolution.y;
-        uv.y = -uv.y;
 
         Ray ray;
         ray.o = ro;
-        ray.d = normalize(uv.x * right + uv.y * up + 1.7 * forward);
+        ray.d = rayDirection(gid, jitter, u);
 
         float3 color = float3(0.0);
         float3 throughput = float3(1.0);
@@ -285,15 +300,145 @@ kernel void cs_pathtrace(texture2d<float, access::read_write> accum [[texture(0)
         sum += min(color, float3(kFireflyClamp));
     }
 
-    float3 mean = sum / float(spp);
+    radiance.write(float4(sum / float(spp), 1.0), gid);
 
-    float4 prev = accum.read(gid);
-    float4 batch = float4(mean, 1.0);
-    if (u.sampleIndex == 0) {
-        accum.write(batch, gid);
-    } else {
-        accum.write(mix(prev, batch, 1.0 / float(u.sampleIndex + 1)), gid);
+    Ray primary;
+    primary.o = ro;
+    primary.d = rayDirection(gid, float2(0.5, 0.5), u);
+    Hit primaryHit;
+    float primaryLightT = 0.0;
+    bool primaryLight = intersectSphere(primary, kLightPos, kLightRadius, primaryLightT);
+    bool primaryScene = trace(primary, primaryHit);
+
+    float4 g = float4(0.0);
+    if (primaryLight && (!primaryScene || primaryLightT < primaryHit.t)) {
+        float3 p = primary.o + primary.d * primaryLightT;
+        g = float4(normalize(p - kLightPos), primaryLightT);
+    } else if (primaryScene) {
+        g = float4(primaryHit.n, primaryHit.t);
     }
+    gbuffer.write(g, gid);
+}
+
+kernel void cs_temporal(texture2d<float, access::read> radiance [[texture(0)]],
+                        texture2d<float, access::read> gCur [[texture(1)]],
+                        texture2d<float, access::read> gPrev [[texture(2)]],
+                        texture2d<float, access::read> histIn [[texture(3)]],
+                        texture2d<float, access::read_write> moments [[texture(4)]],
+                        texture2d<float, access::write> histOut [[texture(5)]],
+                        constant PTUniforms &u [[buffer(0)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    uint2 size = uint2(u.resolution);
+    if (gid.x >= size.x || gid.y >= size.y) {
+        return;
+    }
+
+    float3 curr = radiance.read(gid).rgb;
+    float lum = luminance(curr);
+    float4 mom = moments.read(gid);
+
+    float4 g = gCur.read(gid);
+    float depth = g.w;
+    float3 n = g.xyz;
+
+    bool valid = false;
+    if (depth > 0.0 && u.resetHistory == 0) {
+        float2 raw = (float2(gid) + 0.5 - u.resolution * 0.5) / u.resolution.y;
+        float2 uv = float2(raw.x, -raw.y);
+        float3 fwd = normalize(u.cameraTarget.xyz - u.cameraPos.xyz);
+        float3 right = normalize(cross(fwd, float3(0.0, 1.0, 0.0)));
+        float3 up = cross(right, fwd);
+        float3 world = u.cameraPos.xyz + normalize(uv.x * right + uv.y * up + 1.7 * fwd) * depth;
+
+        float3 pfwd = normalize(u.prevCameraTarget.xyz - u.prevCameraPos.xyz);
+        float3 pright = normalize(cross(pfwd, float3(0.0, 1.0, 0.0)));
+        float3 pup = cross(pright, pfwd);
+        float3 rel = world - u.prevCameraPos.xyz;
+        float z = dot(rel, pfwd);
+        if (z > 0.01) {
+            float2 puv = float2(dot(rel, pright), dot(rel, pup)) / z * 1.7;
+            float2 praw = float2(puv.x, -puv.y);
+            float2 pixel = praw * u.resolution.y + u.resolution * 0.5 - 0.5;
+            int2 ip = int2(round(pixel));
+            if (ip.x >= 0 && ip.y >= 0 && ip.x < int(size.x) && ip.y < int(size.y)) {
+                float4 pg = gPrev.read(uint2(ip));
+                float3 pn = pg.xyz;
+                float pd = pg.w;
+                if (pd > 0.0 && dot(normalize(n), normalize(pn)) > 0.9 &&
+                    abs(pd - depth) < 0.05 * depth) {
+                    valid = true;
+                }
+            }
+        }
+    }
+
+    float4 hist = histIn.read(gid);
+    float len = valid ? hist.a : 0.0;
+    float alpha = max(1.0 / (len + 1.0), 1.0 / (float(kMaxHistory) + 1.0));
+
+    if (!valid || len <= 0.0) {
+        histOut.write(float4(curr, 1.0), gid);
+        moments.write(float4(lum, lum * lum, 0.0, 0.0), gid);
+    } else {
+        float3 color = mix(hist.rgb, curr, alpha);
+        float mean = mix(mom.x, lum, alpha);
+        float meanSq = mix(mom.y, lum * lum, alpha);
+        histOut.write(float4(color, min(len + 1.0, float(kMaxHistory))), gid);
+        moments.write(float4(mean, meanSq, 0.0, 0.0), gid);
+    }
+}
+
+kernel void cs_atrous(texture2d<float, access::read> source [[texture(0)]],
+                      texture2d<float, access::read> gbuffer [[texture(1)]],
+                      texture2d<float, access::read> moments [[texture(2)]],
+                      texture2d<float, access::write> dest [[texture(3)]],
+                      constant PTUniforms &u [[buffer(0)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    uint2 size = uint2(u.resolution);
+    if (gid.x >= size.x || gid.y >= size.y) {
+        return;
+    }
+
+    float4 g0 = gbuffer.read(gid);
+    float z0 = g0.w;
+    float3 n0 = normalize(g0.xyz + 1e-6);
+    float3 c0 = source.read(gid).rgb;
+    float lum0 = luminance(c0);
+    float4 mom = moments.read(gid);
+    float variance = max(0.0, mom.y - mom.x * mom.x);
+    float sigmaL = 0.6 * sqrt(variance) + 0.02;
+
+    float3 sum = c0;
+    float wsum = 1.0;
+    int step = int(u.filterStep);
+
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            int2 p = int2(gid) + int2(dx, dy) * step;
+            p = clamp(p, int2(0), int2(size) - 1);
+            float4 gq = gbuffer.read(uint2(p));
+            float zq = gq.w;
+            if (z0 <= 0.0 || zq <= 0.0) {
+                continue;
+            }
+            float3 nq = normalize(gq.xyz + 1e-6);
+            float3 cq = source.read(uint2(p)).rgb;
+            float lumq = luminance(cq);
+
+            float wz = exp(-abs(z0 - zq) / (0.15 * z0));
+            float wn = pow(max(0.0, dot(n0, nq)), 16.0);
+            float wl = exp(-abs(lum0 - lumq) / sigmaL);
+            float w = wz * wn * wl;
+
+            sum += cq * w;
+            wsum += w;
+        }
+    }
+
+    dest.write(float4(sum / wsum, 1.0), gid);
 }
 
 vertex float4 vs_fullscreen(uint vertexID [[vertex_id]]) {
@@ -303,9 +448,9 @@ vertex float4 vs_fullscreen(uint vertexID [[vertex_id]]) {
 
 fragment float4 fs_display(float4 position [[position]],
                            constant PTUniforms &u [[buffer(0)]],
-                           texture2d<float> accum [[texture(0)]]) {
+                           texture2d<float> color [[texture(0)]]) {
     uint2 coord = uint2(position.xy);
-    float3 c = accum.read(coord).rgb * u.exposure;
+    float3 c = color.read(coord).rgb * u.exposure;
     c = (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14);
     c = pow(clamp(c, 0.0, 1.0), float3(1.0 / 2.2));
     return float4(c, 1.0);

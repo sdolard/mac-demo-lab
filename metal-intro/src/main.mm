@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #import <MetalKit/MetalKit.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -47,6 +48,10 @@ static const char *NameForMode(RendererMode mode) {
 @property (nonatomic) BOOL startFullscreen;
 @property (nonatomic) RendererMode mode;
 @property (nonatomic) NSUInteger samplesPerFrame;
+@property (nonatomic) BOOL denoiseEnabled;
+@property (nonatomic) BOOL continuousMotion;
+@property (nonatomic) NSUInteger fpsFrames;
+@property (nonatomic) NSTimeInterval fpsWindowStart;
 @end
 
 @implementation AppDelegate
@@ -65,6 +70,7 @@ static const char *NameForMode(RendererMode mode) {
                                                backing:NSBackingStoreBuffered
                                                  defer:NO];
     self.window.title = [NSString stringWithFormat:@"mac-demo-lab (%s)", NameForMode(self.mode)];
+    self.fpsWindowStart = CACurrentMediaTime();
 
     self.view = [[DemoView alloc] initWithFrame:frame device:device];
     self.view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -91,6 +97,8 @@ static const char *NameForMode(RendererMode mode) {
     if (self.samplesPerFrame > 0) {
         self.renderer.samplesPerFrame = self.samplesPerFrame;
     }
+    self.renderer.denoiseEnabled = self.denoiseEnabled;
+    self.renderer.continuousMotion = self.continuousMotion;
 
     self.view.delegate = self;
     self.window.contentView = self.view;
@@ -106,6 +114,19 @@ static const char *NameForMode(RendererMode mode) {
 
 - (void)drawInMTKView:(MTKView *)view {
     [self.renderer drawInView:view];
+
+    self.fpsFrames++;
+    NSTimeInterval now = CACurrentMediaTime();
+    NSTimeInterval elapsed = now - self.fpsWindowStart;
+    if (elapsed >= 0.5) {
+        double fps = self.fpsFrames / elapsed;
+        self.window.title = [NSString stringWithFormat:@"mac-demo-lab (%s, %s) - %.1f fps",
+                             NameForMode(self.mode),
+                             self.denoiseEnabled ? "denoise" : "raw",
+                             fps];
+        self.fpsFrames = 0;
+        self.fpsWindowStart = now;
+    }
 }
 
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
@@ -130,7 +151,8 @@ static NSMenu *MakeMainMenu(void) {
     return menu;
 }
 
-static int RunOffscreen(RendererMode mode, NSUInteger frames, NSString *shotPath, NSUInteger spp) {
+static int RunOffscreen(RendererMode mode, NSUInteger frames, NSString *shotPath, NSUInteger spp,
+                        BOOL denoise, BOOL move) {
     if (shotPath && mode != RendererModePathTracer) {
         fprintf(stderr, "--shot is only supported with --mode pt\n");
         return 2;
@@ -155,30 +177,33 @@ static int RunOffscreen(RendererMode mode, NSUInteger frames, NSString *shotPath
 
     if (spp > 0) {
         renderer.samplesPerFrame = spp;
-    } else if (shotPath) {
-        renderer.samplesPerFrame = 16;
     }
+    renderer.denoiseEnabled = denoise;
+    renderer.continuousMotion = move;
 
     if (shotPath) {
         renderer.fixedShot = 0;
     }
 
+    double startTime = CACurrentMediaTime();
     if (![renderer renderOffscreenFrames:frames error:&error]) {
         fprintf(stderr, "offscreen render failed: %s\n", error.localizedDescription.UTF8String);
         return 1;
     }
+    double elapsed = CACurrentMediaTime() - startTime;
+    double fps = elapsed > 0 ? frames / elapsed : 0;
 
     if (shotPath) {
         if (![renderer writeSnapshotToPath:shotPath error:&error]) {
             fprintf(stderr, "snapshot failed: %s\n", error.localizedDescription.UTF8String);
             return 1;
         }
-        printf("shot: %s (%lu frames, %lu samples, mode %s)\n", shotPath.UTF8String,
-               (unsigned long)frames, (unsigned long)renderer.accumulatedSamples,
-               NameForMode(mode));
+        printf("shot: %s (%lu frames, %lu spp, mode %s, denoise %s, %s, %.1f fps)\n",
+               shotPath.UTF8String, (unsigned long)frames, (unsigned long)renderer.samplesPerFrame,
+               NameForMode(mode), denoise ? "on" : "off", move ? "moving" : "static", fps);
     } else {
-        printf("SMOKE OK - %s, mode %s, %lu frames offscreen\n",
-               device.name.UTF8String, NameForMode(mode), (unsigned long)frames);
+        printf("SMOKE OK - %s, mode %s, %lu frames offscreen (%.1f fps)\n",
+               device.name.UTF8String, NameForMode(mode), (unsigned long)frames, fps);
     }
     return 0;
 }
@@ -192,6 +217,8 @@ int main(int argc, const char *argv[]) {
         NSString *shotPath = nil;
         NSUInteger shotFrames = 240;
         NSUInteger spp = 0;
+        BOOL denoise = YES;
+        BOOL move = NO;
 
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--smoke") == 0) {
@@ -216,11 +243,15 @@ int main(int argc, const char *argv[]) {
                 }
             } else if (strcmp(argv[i], "--spp") == 0 && i + 1 < argc) {
                 spp = (NSUInteger)atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--no-denoise") == 0) {
+                denoise = NO;
+            } else if (strcmp(argv[i], "--move") == 0) {
+                move = YES;
             } else if (strcmp(argv[i], "--fullscreen") == 0) {
                 fullscreen = YES;
             } else if (strcmp(argv[i], "--help") == 0) {
                 printf("usage: demo [--mode sdf|pt] [--smoke [frames]] "
-                       "[--shot FILE [frames]] [--spp N] [--fullscreen]\n");
+                       "[--shot FILE [frames]] [--spp N] [--no-denoise] [--move] [--fullscreen]\n");
                 return 0;
             } else {
                 fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -229,10 +260,10 @@ int main(int argc, const char *argv[]) {
         }
 
         if (shotPath) {
-            return RunOffscreen(mode, shotFrames, shotPath, spp);
+            return RunOffscreen(mode, shotFrames, shotPath, spp, denoise, move);
         }
         if (smoke) {
-            return RunOffscreen(mode, smokeFrames, nil, spp);
+            return RunOffscreen(mode, smokeFrames, nil, spp, denoise, move);
         }
 
         NSApplication *app = [NSApplication sharedApplication];
@@ -242,6 +273,8 @@ int main(int argc, const char *argv[]) {
         delegate.startFullscreen = fullscreen;
         delegate.mode = mode;
         delegate.samplesPerFrame = spp;
+        delegate.denoiseEnabled = denoise;
+        delegate.continuousMotion = move;
         app.delegate = delegate;
         app.mainMenu = MakeMainMenu();
         [app run];

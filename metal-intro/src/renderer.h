@@ -16,8 +16,11 @@ typedef NS_ENUM(NSInteger, RendererMode) {
 /// Path tracer samples per dispatch.
 @property (nonatomic) NSUInteger samplesPerFrame;
 
-/// Number of samples accumulated in the current path-traced frame.
-@property (nonatomic, readonly) NSUInteger accumulatedSamples;
+/// SVGF-style spatiotemporal denoiser (default on in path tracer mode).
+@property (nonatomic) BOOL denoiseEnabled;
+
+/// Continuous camera motion instead of hard shot cuts.
+@property (nonatomic) BOOL continuousMotion;
 
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device
                             pixelFormat:(MTLPixelFormat)pixelFormat
